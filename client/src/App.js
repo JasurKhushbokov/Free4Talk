@@ -30,6 +30,7 @@ function App() {
     ]
   };
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     // Socket event listeners
     socket.on('connect', () => {
