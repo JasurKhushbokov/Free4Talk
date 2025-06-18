@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import io from 'socket.io-client';
 import './App.css';
 
@@ -16,11 +16,15 @@ function App() {
   const [newRoomName, setNewRoomName] = useState('');
   const [isMuted, setIsMuted] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
+  const [hasVideo, setHasVideo] = useState(false);
+  const [showParticipants, setShowParticipants] = useState(false);
 
   const localAudioRef = useRef(null);
   const remoteAudiosRef = useRef({});
   const peerConnectionsRef = useRef({});
   const localStreamRef = useRef(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRefs = useRef({});
 
   // WebRTC configuration
   const rtcConfig = {
@@ -80,23 +84,13 @@ function App() {
       if (remoteAudiosRef.current[user.id]) {
         delete remoteAudiosRef.current[user.id];
       }
+      if (remoteVideoRefs.current[user.id]) {
+        delete remoteVideoRefs.current[user.id];
+      }
     });
 
-    socket.on('new-message', (message) => {
-      setMessages(prev => [...prev, message]);
-    });
-
-    // WebRTC signaling
-    socket.on('offer', async (data) => {
-      await handleOffer(data.offer, data.sender);
-    });
-
-    socket.on('answer', async (data) => {
-      await handleAnswer(data.answer, data.sender);
-    });
-
-    socket.on('ice-candidate', async (data) => {
-      await handleIceCandidate(data.candidate, data.sender);
+    socket.on('user-muted', (data) => {
+      setParticipants(prev => prev.map(p => p.id === data.userId ? { ...p, isMuted: data.isMuted } : p));
     });
 
     return () => {
@@ -109,34 +103,134 @@ function App() {
       socket.off('joined-room');
       socket.off('user-joined-room');
       socket.off('user-left');
-      socket.off('new-message');
-      socket.off('offer');
-      socket.off('answer');
-      socket.off('ice-candidate');
+      socket.off('user-muted');
     };
   }, []);
+
+  useEffect(() => {
+    socket.on('new-message', (message) => {
+      setMessages(prev => [...prev, message]);
+    });
+    
+    return () => {
+      socket.off('new-message');
+    };
+  }, []);
+
+  // WebRTC signaling
+  socket.on('offer', async (data) => {
+    await handleOffer(data.offer, data.sender);
+  });
+
+  socket.on('answer', async (data) => {
+    await handleAnswer(data.answer, data.sender);
+  });
+
+  socket.on('ice-candidate', async (data) => {
+    await handleIceCandidate(data.candidate, data.sender);
+  });
 
   // Initialize audio stream
   const initializeAudio = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      console.log('Initializing audio...');
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      
+      console.log('Audio stream obtained:', stream.getAudioTracks());
       localStreamRef.current = stream;
-      if (localAudioRef.current) {
-        localAudioRef.current.srcObject = stream;
-      }
-      return stream;
+      
+      // Update all peer connections
+      Object.values(peerConnectionsRef.current).forEach(pc => {
+        stream.getAudioTracks().forEach(track => {
+          pc.addTrack(track, stream);
+        });
+      });
+      
+      return true;
     } catch (error) {
-      console.error('Error accessing microphone:', error);
-      alert('Please allow microphone access to use voice chat');
+      console.error('Audio initialization failed:', error);
+      alert('Microphone access is required for voice chat');
+      return false;
     }
   };
 
-  // Initialize peer connection
-  const initializePeerConnection = async (peerId) => {
-    if (!localStreamRef.current) {
-      await initializeAudio();
+  const initializePeerConnection = useCallback((peerId) => {
+    const pc = new RTCPeerConnection(rtcConfig);
+    peerConnectionsRef.current[peerId] = pc;
+
+    // Add local stream if available
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamRef.current);
+      });
     }
 
+    // Handle remote stream
+    pc.ontrack = (event) => {
+      const remoteStream = event.streams[0];
+      if (!remoteVideoRefs.current[peerId]) {
+        const video = document.createElement('video');
+        video.srcObject = remoteStream;
+        video.autoplay = true;
+        video.className = 'remote-video';
+        remoteVideoRefs.current[peerId] = video;
+        document.getElementById('videos-container').appendChild(video);
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit('ice-candidate', {
+          candidate: event.candidate,
+          target: peerId
+        });
+      }
+    };
+  }, []);
+
+  const handleOffer = async (offer, senderId) => {
+    try {
+      const pc = peerConnectionsRef.current[senderId] || createPeerConnection(senderId);
+      if (pc.signalingState === 'stable') {
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('answer', { answer, target: senderId });
+      }
+    } catch (err) {
+      console.error('Error handling offer:', err);
+    }
+  };
+
+  const handleAnswer = async (answer, senderId) => {
+    try {
+      const pc = peerConnectionsRef.current[senderId];
+      if (pc && pc.signalingState === 'have-local-offer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      }
+    } catch (err) {
+      console.error('Error setting remote answer:', err);
+    }
+  };
+
+  const handleIceCandidate = async (candidate, senderId) => {
+    const pc = peerConnectionsRef.current[senderId];
+    if (pc && pc.remoteDescription) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.error('Error adding ICE candidate:', err);
+      }
+    }
+  };
+
+  const createPeerConnection = (peerId) => {
     const peerConnection = new RTCPeerConnection(rtcConfig);
     peerConnectionsRef.current[peerId] = peerConnection;
 
@@ -156,6 +250,12 @@ function App() {
         audio.autoplay = true;
         remoteAudiosRef.current[peerId] = audio;
       }
+      if (!remoteVideoRefs.current[peerId]) {
+        const video = document.createElement('video');
+        video.srcObject = remoteStream;
+        video.autoplay = true;
+        remoteVideoRefs.current[peerId] = video;
+      }
     };
 
     // Handle ICE candidates
@@ -168,69 +268,7 @@ function App() {
       }
     };
 
-    // Create and send offer
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
-    socket.emit('offer', { offer, target: peerId });
-  };
-
-  // Handle incoming offer
-  const handleOffer = async (offer, senderId) => {
-    if (!localStreamRef.current) {
-      await initializeAudio();
-    }
-
-    const peerConnection = new RTCPeerConnection(rtcConfig);
-    peerConnectionsRef.current[senderId] = peerConnection;
-
-    // Add local stream
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => {
-        peerConnection.addTrack(track, localStreamRef.current);
-      });
-    }
-
-    // Handle remote stream
-    peerConnection.ontrack = (event) => {
-      const remoteStream = event.streams[0];
-      if (!remoteAudiosRef.current[senderId]) {
-        const audio = new Audio();
-        audio.srcObject = remoteStream;
-        audio.autoplay = true;
-        remoteAudiosRef.current[senderId] = audio;
-      }
-    };
-
-    // Handle ICE candidates
-    peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        socket.emit('ice-candidate', {
-          candidate: event.candidate,
-          target: senderId
-        });
-      }
-    };
-
-    await peerConnection.setRemoteDescription(offer);
-    const answer = await peerConnection.createAnswer();
-    await peerConnection.setLocalDescription(answer);
-    socket.emit('answer', { answer, target: senderId });
-  };
-
-  // Handle incoming answer
-  const handleAnswer = async (answer, senderId) => {
-    const peerConnection = peerConnectionsRef.current[senderId];
-    if (peerConnection) {
-      await peerConnection.setRemoteDescription(answer);
-    }
-  };
-
-  // Handle ICE candidate
-  const handleIceCandidate = async (candidate, senderId) => {
-    const peerConnection = peerConnectionsRef.current[senderId];
-    if (peerConnection) {
-      await peerConnection.addIceCandidate(candidate);
-    }
+    return peerConnection;
   };
 
   const handleLogin = (e) => {
@@ -254,10 +292,14 @@ function App() {
     socket.emit('join-room', roomId);
   };
 
-  const handleSendMessage = (e) => {
-    e.preventDefault();
-    if (newMessage.trim()) {
-      socket.emit('send-message', { content: newMessage.trim() });
+  const handleSendMessage = () => {
+    if (newMessage.trim() && currentRoom) {
+      const message = {
+        text: newMessage,
+        username,
+        roomId: currentRoom.id
+      };
+      socket.emit('send-message', message);
       setNewMessage('');
     }
   };
@@ -271,6 +313,7 @@ function App() {
     Object.values(peerConnectionsRef.current).forEach(pc => pc.close());
     peerConnectionsRef.current = {};
     remoteAudiosRef.current = {};
+    remoteVideoRefs.current = {};
     
     setCurrentView('lobby');
     setCurrentRoom(null);
@@ -278,14 +321,96 @@ function App() {
     setMessages([]);
   };
 
-  const toggleMute = () => {
-    if (localStreamRef.current) {
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        setIsMuted(!audioTrack.enabled);
+  const toggleMute = async () => {
+    try {
+      if (!localStreamRef.current) {
+        const success = await initializeAudio();
+        if (!success) return;
       }
+
+      const newMutedState = !isMuted;
+      const audioTracks = localStreamRef.current.getAudioTracks();
+      
+      console.log(`Setting ${audioTracks.length} track(s) to:`, newMutedState);
+      audioTracks.forEach(track => {
+        track.enabled = newMutedState;
+      });
+
+      setIsMuted(newMutedState);
+      socket.emit('user-muted', {
+        userId: socket.id,
+        isMuted: newMutedState
+      });
+    } catch (error) {
+      console.error('Mute toggle error:', error);
     }
+  };
+
+  const toggleVideo = async () => {
+    try {
+      if (!localStreamRef.current) {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: true, 
+          audio: !isMuted 
+        });
+        localStreamRef.current = stream;
+        localVideoRef.current.srcObject = stream;
+      } else {
+        const videoTracks = localStreamRef.current.getVideoTracks();
+        const newVideoState = !hasVideo;
+        
+        if (newVideoState) {
+          const stream = await navigator.mediaDevices.getUserMedia({ 
+            video: true,
+            audio: !isMuted
+          });
+          localStreamRef.current.getVideoTracks().forEach(track => track.stop());
+          stream.getVideoTracks().forEach(track => {
+            localStreamRef.current.addTrack(track);
+            Object.values(peerConnectionsRef.current).forEach(pc => {
+              pc.addTrack(track, localStreamRef.current);
+            });
+          });
+          localVideoRef.current.srcObject = stream;
+        } else {
+          videoTracks.forEach(track => track.enabled = false);
+        }
+      }
+      setHasVideo(prev => !prev);
+      socket.emit('video-toggle', { 
+        userId: socket.id, 
+        hasVideo: !hasVideo 
+      });
+    } catch (err) {
+      console.error('Error toggling video:', err);
+    }
+  };
+
+  const handleFileUpload = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const fileData = {
+          name: file.name,
+          type: file.type,
+          size: file.size,
+          content: event.target.result.split(',')[1] // Remove data URL prefix
+        };
+        
+        socket.emit('file-upload', fileData, currentRoom, (response) => {
+          if (response.error) {
+            reject(response.error);
+          } else {
+            resolve(response);
+          }
+        });
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const downloadFile = (fileId, fileName) => {
+    window.open(`${process.env.REACT_APP_API_URL}/files/${fileId}?download=${fileName}`);
   };
 
   if (!isLoggedIn) {
@@ -369,86 +494,146 @@ function App() {
   }
 
   return (
-    <div className="container">
-      <div className="card" style={{ marginBottom: '20px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h1 style={{ color: '#2d3748' }}>🎙️ {currentRoom?.name}</h1>
-          <button onClick={handleLeaveRoom} className="btn btn-secondary">
-            Leave Room
+    <div className="chat-container">
+      {/* Left sidebar - Chat */}
+      <div className="chat-sidebar">
+        <div className="messages">
+          {messages.map((msg, i) => (
+            <div 
+              key={i} 
+              className={`message ${msg.username === username ? 'sent' : 'received'}`}
+              style={{ 
+                display: 'flex', 
+                justifyContent: msg.username === username ? 'flex-end' : 'flex-start', 
+                marginBottom: '16px' 
+              }}
+            >
+              <div className="message-text" style={{ 
+                backgroundColor: msg.username === username ? '#48bb78' : '#e2e8f0', 
+                color: msg.username === username ? '#fff' : '#2d3748', 
+                padding: '8px', 
+                borderRadius: '8px' 
+              }}>
+                {msg.text}
+              </div>
+              <div className="message-time" style={{ 
+                fontSize: '12px', 
+                color: '#718096', 
+                marginLeft: msg.username === username ? '8px' : '0', 
+                marginRight: msg.username === username ? '0' : '8px' 
+              }}>
+                {new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+              </div>
+            </div>
+          ))}
+        </div>
+        
+        <div className="message-input">
+          <input
+            type="text"
+            value={newMessage}
+            onChange={(e) => setNewMessage(e.target.value)}
+            onKeyPress={(e) => {
+              if (e.key === 'Enter') {
+                handleSendMessage();
+              }
+            }}
+            placeholder="Type a message..."
+          />
+          <button 
+            onClick={handleSendMessage}
+            className="send-button"
+            disabled={!newMessage.trim()}
+          >
+            <svg className="send-icon" viewBox="0 0 24 24">
+              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+            </svg>
           </button>
         </div>
-      </div>
-
-      <div className="chat-container">
-        <div className="voice-panel">
-          <h2 style={{ marginBottom: '16px', color: '#4a5568' }}>Voice Chat</h2>
+        
+        <div className="file-sharing-ui">
+          <input 
+            type="file"
+            onChange={(e) => {
+              if (e.target.files[0]) {
+                handleFileUpload(e.target.files[0])
+                  .then(() => alert('File shared successfully!'))
+                  .catch(err => alert(`Error: ${err}`));
+              }
+            }}
+            style={{ display: 'none' }}
+            id="file-input"
+          />
           
-          <div className="participants">
-            <h3 style={{ marginBottom: '12px', color: '#2d3748' }}>
-              Participants ({participants.length})
-            </h3>
-            {participants.map(participant => (
-              <div key={participant.id} className="participant">
-                <span>{participant.username}</span>
-                <span style={{ fontSize: '12px', color: '#718096' }}>
-                  {participant.id === socket.id ? '(You)' : '🎤'}
-                </span>
+          <button 
+            onClick={() => document.getElementById('file-input').click()}
+            className="file-share-btn"
+          >
+            📁 Share File
+          </button>
+
+          <div className="file-messages">
+            {messages.filter(m => m.type === 'file').map(file => (
+              <div key={file.id} className="file-message">
+                <button 
+                  onClick={() => downloadFile(file.id, file.name)}
+                  className="file-download-btn"
+                >
+                  📄 {file.name} ({Math.round(file.size/1024)}KB)
+                </button>
               </div>
             ))}
           </div>
+        </div>
+      </div>
 
-          <div className="audio-controls">
-            <button
-              onClick={toggleMute}
-              className={`mute-btn ${isMuted ? 'muted' : 'unmuted'}`}
-              title={isMuted ? 'Unmute' : 'Mute'}
-            >
-              {isMuted ? '🔇' : '🎤'}
-            </button>
-          </div>
-
-          <audio ref={localAudioRef} muted style={{ display: 'none' }} />
+      {/* Main content - Videos */}
+      <div className="video-main">
+        <div id="videos-container" className="videos-grid">
+          {localStreamRef.current && (
+            <video 
+              ref={localVideoRef}
+              autoPlay
+              muted
+              className="local-video"
+            />
+          )}
         </div>
 
-        <div className="chat-panel">
-          <h2 style={{ marginBottom: '16px', color: '#4a5568' }}>Text Chat</h2>
-          
-          <div className="messages">
-            {messages.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#718096', padding: '20px' }}>
-                No messages yet. Start the conversation!
-              </div>
-            ) : (
-              messages.map(message => (
-                <div key={message.id} className="message">
-                  <div className="message-header">
-                    {message.username}
-                    <span style={{ float: 'right', fontWeight: 'normal', fontSize: '12px' }}>
-                      {new Date(message.timestamp).toLocaleTimeString()}
-                    </span>
-                  </div>
-                  <div>{message.content}</div>
-                </div>
-              ))
-            )}
-          </div>
+        <div className="control-bar">
+          <button onClick={toggleMute} title={isMuted ? "Unmute" : "Mute"}>
+            {isMuted ? '🔇' : '🎤'}
+          </button>
+          <button onClick={toggleVideo} title={hasVideo ? "Stop Video" : "Start Video"}>
+            {hasVideo ? '📹' : '📷'}
+          </button>
+          <button onClick={handleLeaveRoom} title="Leave Room" style={{background: '#ff4d4f', color: 'white'}}>
+            🚪
+          </button>
+        </div>
 
-          <form onSubmit={handleSendMessage}>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <input
-                type="text"
-                placeholder="Type a message..."
-                value={newMessage}
-                onChange={(e) => setNewMessage(e.target.value)}
-                className="input"
-                style={{ flex: 1 }}
-                required
-              />
-              <button type="submit" className="btn">
-                Send
-              </button>
+        <div className="participants-container">
+          <button 
+            onClick={() => setShowParticipants(!showParticipants)}
+            className="participants-toggle"
+            title={showParticipants ? "Hide participants" : "Show participants"}
+          >
+            👥 {participants.length}
+          </button>
+          
+          {showParticipants && (
+            <div className="participants-panel">
+              {participants.map(participant => (
+                <div key={participant.id} className="participant">
+                  <span>
+                    {participant.username}
+                    {participant.isMuted && <span className="mute-icon">🔇</span>}
+                    {!participant.hasVideo && <span className="video-off-icon">📷</span>}
+                  </span>
+                </div>
+              ))}
             </div>
-          </form>
+          )}
         </div>
       </div>
     </div>

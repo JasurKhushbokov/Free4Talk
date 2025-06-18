@@ -3,6 +3,9 @@ const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const { getMessageType } = require('./utils/messageTypes');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
@@ -40,11 +43,7 @@ class Room {
   }
 
   addMessage(message) {
-    this.messages.push({
-      id: uuidv4(),
-      ...message,
-      timestamp: new Date()
-    });
+    this.messages.push(message);
   }
 
   getUsers() {
@@ -138,28 +137,59 @@ io.on('connection', (socket) => {
   });
 
   // Send message in room
-  socket.on('send-message', (data) => {
-    const user = users.get(socket.id);
-    if (!user) return;
+  socket.on('send-message', (message) => {
+    const room = rooms.get(message.roomId);
+    if (room) {
+      const fullMessage = {
+        ...message,
+        id: uuidv4(),
+        timestamp: Date.now(),
+        type: getMessageType(message.text)
+      };
+      room.addMessage(fullMessage);
+      io.in(message.roomId).emit('new-message', fullMessage);
+    }
+  });
 
-    const roomId = [...socket.rooms].find(room => room !== socket.id);
-    const room = rooms.get(roomId);
-    
-    if (!room) return;
+  // File upload handler
+  const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'application/pdf', 'text/plain'];
+  const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
-    const message = {
-      userId: user.id,
-      username: user.username,
-      content: data.content,
-      type: 'text'
-    };
-
-    room.addMessage(message);
-    io.to(roomId).emit('new-message', {
-      id: room.messages[room.messages.length - 1].id,
-      ...message,
-      timestamp: room.messages[room.messages.length - 1].timestamp
-    });
+  socket.on('file-upload', (fileData, roomId) => {
+    if (!ALLOWED_TYPES.includes(fileData.type)) {
+      return socket.emit('file-error', { error: 'File type not allowed' });
+    }
+    if (fileData.size > MAX_FILE_SIZE) {
+      return socket.emit('file-error', { error: 'File too large (max 10MB)' });
+    }
+    try {
+      const fileId = uuidv4();
+      const filePath = path.join(__dirname, 'uploads', fileId);
+      
+      fs.writeFile(filePath, fileData.content, 'base64', (err) => {
+        if (err) {
+          console.error('File save error:', err);
+          socket.emit('file-error', { error: 'Failed to save file' });
+          return;
+        }
+        
+        const fileInfo = {
+          id: fileId,
+          name: fileData.name,
+          type: fileData.type,
+          size: fileData.size,
+          sender: socket.id,
+          timestamp: Date.now()
+        };
+        
+        // Broadcast to room
+        socket.to(roomId).emit('file-received', fileInfo);
+        socket.emit('file-uploaded', fileInfo);
+      });
+    } catch (err) {
+      console.error('File processing error:', err);
+      socket.emit('file-error', { error: 'File processing failed' });
+    }
   });
 
   // WebRTC signaling
@@ -182,6 +212,35 @@ io.on('connection', (socket) => {
       candidate: data.candidate,
       sender: socket.id
     });
+  });
+
+  // Video signaling handlers
+  socket.on('video-offer', (data) => {
+    socket.to(data.target).emit('video-offer', {
+      offer: data.offer,
+      sender: socket.id
+    });
+  });
+
+  socket.on('video-answer', (data) => {
+    socket.to(data.target).emit('video-answer', {
+      answer: data.answer,
+      sender: socket.id
+    });
+  });
+
+  // Server-side mute handling
+  socket.on('user-muted', ({ userId, isMuted }) => {
+    socket.broadcast.emit('user-muted-update', { userId, isMuted });
+  });
+
+  // Video toggle handling
+  socket.on('video-toggle', ({ userId, hasVideo }) => {
+    // Broadcast to all room participants
+    const room = [...socket.rooms].find(r => r !== socket.id);
+    if (room) {
+      io.to(room).emit('video-toggle-update', { userId, hasVideo });
+    }
   });
 
   // Handle disconnect
@@ -212,6 +271,16 @@ io.on('connection', (socket) => {
       users.delete(socket.id);
     }
   });
+});
+
+// File download endpoint
+app.get('/files/:id', (req, res) => {
+  const filePath = path.join(__dirname, 'uploads', req.params.id);
+  if (fs.existsSync(filePath)) {
+    res.sendFile(filePath);
+  } else {
+    res.status(404).send('File not found');
+  }
 });
 
 const PORT = process.env.PORT || 5000;
